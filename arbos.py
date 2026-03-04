@@ -9,6 +9,7 @@ from datetime import datetime
 PROMPT_FILE = Path(__file__).parent / "PROMPT.md"
 WORKING_DIR = Path(__file__).parent
 HISTORY_DIR = WORKING_DIR / "history"
+RESTART_FLAG = WORKING_DIR / ".restart"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -283,6 +284,10 @@ def main() -> None:
         header(f"Iteration {loop_count}")
         dim(f"prompt={len(prompt)} chars")
         success = run_step(prompt)
+        if RESTART_FLAG.exists():
+            RESTART_FLAG.unlink()
+            ok("Restart requested — exiting for pm2 to restart with updated code")
+            sys.exit(0)
         if success:
             consecutive_failures = 0
         else:
