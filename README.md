@@ -10,10 +10,9 @@ curl -fsSL https://raw.githubusercontent.com/unconst/Arbos/main/run.sh | bash
 
 ## Next steps
 
-You can just ask how things work
+You can just ask the chat how things work
 ```
-# <prompt>
-How do you work
+How do you work?
 ```
 
 The main thing is creating agents which run continously on a ralph-loop: calling the same prompt over and over with a delay between calls.
