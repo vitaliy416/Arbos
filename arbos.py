@@ -349,6 +349,8 @@ def run_step(prompt: str, step_number: int) -> bool:
         preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
         _log(f"prompt preview: {preview}")
 
+        _send_telegram_text(f"Step {step_number}: starting plan phase")
+
         plan_result = run_agent(
             ["codex", "exec", "--sandbox", "read-only", "--json", prompt],
             phase="plan",
@@ -369,8 +371,10 @@ def run_step(prompt: str, step_number: int) -> bool:
             f"Now implement this plan. The original request was:\n\n{prompt}"
         )
 
+        _send_telegram_text(f"Step {step_number}: starting exec phase")
+
         exec_result = run_agent(
-            ["codex", "exec", "--full-auto", "--json", execute_prompt],
+            ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--json", execute_prompt],
             phase="exec",
             output_file=run_dir / "exec_output.txt",
         )
@@ -494,7 +498,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, execute: bool = False
     """Run the Codex CLI and stream output into a Telegram message."""
     cmd = ["codex", "exec", "--json"]
     if execute:
-        cmd.append("--full-auto")
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
     else:
         cmd.extend(["--sandbox", "read-only"])
 
