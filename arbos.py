@@ -310,6 +310,13 @@ def _write_claude_settings():
         _log("WARNING: OPENROUTER_API_KEY not set in .env — claude calls will fail")
     settings = {
         "model": CLAUDE_MODEL,
+        "permissions": {
+            "allow": [
+                "Bash(*)", "Read(*)", "Write(*)", "Edit(*)",
+                "Glob(*)", "Grep(*)", "WebFetch(*)", "WebSearch(*)",
+                "TodoWrite(*)", "NotebookEdit(*)", "Task(*)",
+            ],
+        },
         "env": {
             "ANTHROPIC_API_KEY": api_key,
             "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
