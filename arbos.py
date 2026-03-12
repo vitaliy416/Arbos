@@ -242,6 +242,8 @@ _shutdown = threading.Event()
 _bot_busy = threading.Lock()
 _claude_semaphore = threading.Semaphore(MAX_CONCURRENT)
 _step_count = 0
+_goal_hash: str = ""
+_goal_step_count = 0
 _child_procs: set[subprocess.Popen] = set()
 _child_procs_lock = threading.Lock()
 
@@ -270,7 +272,7 @@ def fmt_duration(seconds: float) -> str:
 
 # ── Prompt helpers ───────────────────────────────────────────────────────────
 
-def load_prompt(consume_inbox: bool = False) -> str:
+def load_prompt(consume_inbox: bool = False, goal_step: int = 0) -> str:
     """Build full prompt: PROMPT.md + GOAL.md + STATE.md + INBOX.md + chatlog."""
     parts = []
     if PROMPT_FILE.exists():
@@ -280,7 +282,8 @@ def load_prompt(consume_inbox: bool = False) -> str:
     if GOAL_FILE.exists():
         goal_text = GOAL_FILE.read_text().strip()
         if goal_text:
-            parts.append(f"## Goal\n\n{goal_text}")
+            header = f"## Goal (step {goal_step})" if goal_step else "## Goal"
+            parts.append(f"{header}\n\n{goal_text}")
     if STATE_FILE.exists():
         state_text = STATE_FILE.read_text().strip()
         if state_text:
@@ -1134,7 +1137,7 @@ def extract_text(result: subprocess.CompletedProcess) -> str:
     return output
 
 
-def run_step(prompt: str, step_number: int) -> bool:
+def run_step(prompt: str, step_number: int, goal_step: int = 0) -> bool:
     global _log_fh
 
     run_dir = make_run_dir()
@@ -1144,7 +1147,37 @@ def run_step(prompt: str, step_number: int) -> bool:
     with _log_lock:
         _log_fh = open(log_file, "a", encoding="utf-8")
 
-    STEP_MSG_FILE.unlink(missing_ok=True)
+    target = _step_update_target()
+    step_label = f"Step {goal_step}" if goal_step else f"Step {step_number}"
+    step_msg_id: int | None = None
+    step_msg_text = ""
+    last_edit = 0.0
+
+    if target:
+        step_msg_id = _send_telegram_new(f"{step_label}: starting...", target=target)
+        if step_msg_id:
+            STEP_MSG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            STEP_MSG_FILE.write_text(json.dumps({
+                "msg_id": step_msg_id, "text": f"{step_label}: starting...",
+            }))
+    else:
+        STEP_MSG_FILE.unlink(missing_ok=True)
+
+    def _edit_step_msg(text: str, *, force: bool = False):
+        nonlocal last_edit, step_msg_text
+        if not step_msg_id or not target:
+            return
+        now = time.time()
+        if not force and now - last_edit < 3.0:
+            return
+        step_msg_text = text
+        _edit_telegram_text(step_msg_id, text, target=target)
+        STEP_MSG_FILE.write_text(json.dumps({"msg_id": step_msg_id, "text": text}))
+        last_edit = now
+
+    def _on_activity(status: str):
+        elapsed = fmt_duration(time.monotonic() - t0)
+        _edit_step_msg(f"{step_label} ({elapsed})\n{status}")
 
     success = False
     try:
@@ -1159,6 +1192,7 @@ def run_step(prompt: str, step_number: int) -> bool:
             _claude_cmd(prompt),
             phase="step",
             output_file=run_dir / "output.txt",
+            on_activity=_on_activity,
         )
 
         rollout_text = extract_text(result)
@@ -1174,33 +1208,76 @@ def run_step(prompt: str, step_number: int) -> bool:
             if _log_fh:
                 _log_fh.close()
                 _log_fh = None
+        try:
+            elapsed = fmt_duration(time.monotonic() - t0)
+            rollout = (run_dir / "rollout.md").read_text() if (run_dir / "rollout.md").exists() else ""
+            status = "done" if success else "failed"
+
+            agent_text = ""
+            if STEP_MSG_FILE.exists():
+                try:
+                    state = json.loads(STEP_MSG_FILE.read_text())
+                    saved = state.get("text", "")
+                    prefix = f"{step_label}: starting..."
+                    if saved != prefix and not saved.startswith(f"{step_label} ("):
+                        agent_text = saved
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            parts = [f"{step_label} ({elapsed}, {status})"]
+            if agent_text:
+                parts.append(agent_text)
+            if rollout.strip():
+                parts.append(rollout.strip()[:3500])
+            final = "\n\n".join(parts)
+
+            _edit_step_msg(final, force=True)
+            log_chat("bot", final[:1000])
+            STEP_MSG_FILE.unlink(missing_ok=True)
+        except Exception as exc:
+            _log(f"step message finalize failed: {str(exc)[:120]}")
 
 
 # ── Agent loop ───────────────────────────────────────────────────────────────
 
 def agent_loop():
-    global _step_count
+    global _step_count, _goal_hash, _goal_step_count
     failures = 0
 
     while True:
         if not GOAL_FILE.exists() or not GOAL_FILE.read_text().strip():
+            if _goal_hash:
+                _log(f"goal cleared after {_goal_step_count} steps")
+                _goal_hash = ""
+                _goal_step_count = 0
             _agent_wake.wait(timeout=5)
             continue
 
         _bot_busy.acquire()
         _bot_busy.release()
 
-        _step_count += 1
-        _log(f"Step {_step_count}", blank=True)
+        import hashlib
+        current_goal = GOAL_FILE.read_text().strip()
+        current_hash = hashlib.sha256(current_goal.encode()).hexdigest()[:16]
+        if current_hash != _goal_hash:
+            if _goal_hash:
+                _log(f"goal changed after {_goal_step_count} steps on previous goal")
+            _goal_hash = current_hash
+            _goal_step_count = 0
+            _log(f"new goal [{current_hash}]: {current_goal[:100]}")
 
-        prompt = load_prompt(consume_inbox=True)
+        _step_count += 1
+        _goal_step_count += 1
+        _log(f"Step {_step_count} (goal step {_goal_step_count})", blank=True)
+
+        prompt = load_prompt(consume_inbox=True, goal_step=_goal_step_count)
         if not prompt:
             _agent_wake.wait(timeout=5)
             continue
 
         _log(f"prompt={len(prompt)} chars")
 
-        success = run_step(prompt, _step_count)
+        success = run_step(prompt, _step_count, goal_step=_goal_step_count)
 
         if success:
             failures = 0
@@ -1497,7 +1574,7 @@ def run_bot():
             if dirs:
                 last_run = dirs[-1].name
         lines = [
-            f"Steps completed: {_step_count}",
+            f"Steps: {_goal_step_count} on current goal, {_step_count} total",
             f"Loop active: {'yes' if active else 'no (goal empty)'}",
             f"Last run: {last_run or 'none'}",
             f"Goal: {goal[:300]}",
