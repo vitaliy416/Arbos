@@ -6,11 +6,17 @@ import subprocess
 import sys
 import time
 import threading
+import uuid
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 
 from dotenv import load_dotenv
+import httpx
 import requests
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 WORKING_DIR = Path(__file__).parent
 load_dotenv(WORKING_DIR / ".env")
@@ -29,6 +35,20 @@ STEP_SOURCE_CHAR_LIMIT = 3500
 STEP_SUMMARY_MODEL = ""
 MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "4"))
 
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "moonshotai/Kimi-K2.5-TEE")
+CHUTES_MODELS = [
+    "moonshotai/Kimi-K2.5-TEE",
+    "zai-org/GLM-5-TEE",
+    "MiniMaxAI/MiniMax-M2.5-TEE",
+]
+PROXY_PORT = int(os.environ.get("PROXY_PORT", "8089"))
+CHUTES_API_KEY = os.environ.get("CHUTES_API_KEY", "")
+CHUTES_BASE_URL = os.environ.get("CHUTES_BASE_URL", "https://llm.chutes.ai/v1")
+PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "600"))
+FALLBACK_TIMEOUT = int(os.environ.get("FALLBACK_TIMEOUT", "90"))
+IS_ROOT = os.getuid() == 0
+MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
 _log_fh = None
 _log_lock = threading.Lock()
 _agent_wake = threading.Event()
@@ -280,14 +300,441 @@ def _send_step_update(step_number: int, run_dir: Path, success: bool):
     _send_telegram_text(summary_text, target=target)
 
 
+# ── Chutes proxy (Anthropic Messages API → OpenAI Chat Completions) ──────────
+
+_proxy_app = FastAPI(title="Chutes Proxy")
+
+
+def _convert_tools_to_openai(anthropic_tools: list[dict]) -> list[dict]:
+    out = []
+    for t in anthropic_tools:
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        })
+    return out
+
+
+def _convert_messages_to_openai(
+    messages: list[dict], system: str | list | None = None
+) -> list[dict]:
+    out: list[dict] = []
+
+    if system:
+        if isinstance(system, list):
+            text_parts = [b["text"] for b in system if b.get("type") == "text"]
+            system = "\n\n".join(text_parts)
+        if system:
+            out.append({"role": "system", "content": system})
+
+    for msg in messages:
+        role = msg["role"]
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+
+        if not isinstance(content, list):
+            out.append({"role": role, "content": str(content)})
+            continue
+
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        tool_results: list[dict] = []
+        image_parts: list[dict] = []
+
+        for block in content:
+            btype = block.get("type", "")
+
+            if btype == "text":
+                text_parts.append(block["text"])
+
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": block["id"],
+                    "type": "function",
+                    "function": {
+                        "name": block["name"],
+                        "arguments": json.dumps(block.get("input", {})),
+                    },
+                })
+
+            elif btype == "tool_result":
+                result_content = block.get("content", "")
+                if isinstance(result_content, list):
+                    result_content = "\n".join(
+                        b.get("text", "") for b in result_content if b.get("type") == "text"
+                    )
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": block["tool_use_id"],
+                    "content": str(result_content),
+                })
+
+            elif btype == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64":
+                    image_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{source.get('media_type', 'image/png')};base64,{source['data']}"
+                        },
+                    })
+
+        if role == "assistant":
+            oai_msg: dict[str, Any] = {"role": "assistant"}
+            if text_parts:
+                oai_msg["content"] = "\n".join(text_parts)
+            else:
+                oai_msg["content"] = None
+            if tool_calls:
+                oai_msg["tool_calls"] = tool_calls
+            out.append(oai_msg)
+
+        elif role == "user":
+            if tool_results:
+                for tr in tool_results:
+                    out.append(tr)
+            if text_parts or image_parts:
+                if image_parts:
+                    content_blocks = [{"type": "text", "text": t} for t in text_parts] + image_parts
+                    out.append({"role": "user", "content": content_blocks})
+                elif text_parts:
+                    out.append({"role": "user", "content": "\n".join(text_parts)})
+        else:
+            out.append({"role": role, "content": "\n".join(text_parts) if text_parts else ""})
+
+    return out
+
+
+def _build_openai_request(body: dict, *, model_override: str | None = None) -> dict:
+    oai: dict[str, Any] = {
+        "model": model_override or CLAUDE_MODEL,
+        "messages": _convert_messages_to_openai(
+            body.get("messages", []),
+            system=body.get("system"),
+        ),
+    }
+    if "max_tokens" in body:
+        oai["max_tokens"] = body["max_tokens"]
+    if body.get("tools"):
+        oai["tools"] = _convert_tools_to_openai(body["tools"])
+        oai["tool_choice"] = "auto"
+    if body.get("temperature") is not None:
+        oai["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        oai["top_p"] = body["top_p"]
+    if body.get("stream"):
+        oai["stream"] = True
+        oai["stream_options"] = {"include_usage": True}
+    return oai
+
+
+def _openai_response_to_anthropic(oai_resp: dict, model: str) -> dict:
+    choice = oai_resp.get("choices", [{}])[0]
+    message = choice.get("message", {})
+    finish = choice.get("finish_reason", "stop")
+
+    content_blocks: list[dict] = []
+    if message.get("content"):
+        content_blocks.append({"type": "text", "text": message["content"]})
+    for tc in (message.get("tool_calls") or []):
+        try:
+            args = json.loads(tc["function"]["arguments"])
+        except (json.JSONDecodeError, KeyError):
+            args = {}
+        content_blocks.append({
+            "type": "tool_use",
+            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
+            "name": tc["function"]["name"],
+            "input": args,
+        })
+
+    if finish == "tool_calls":
+        stop_reason = "tool_use"
+    elif finish == "length":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+
+    usage = oai_resp.get("usage", {})
+    return {
+        "id": oai_resp.get("id", f"msg_{uuid.uuid4().hex}"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks or [{"type": "text", "text": ""}],
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def _stream_openai_to_anthropic(oai_response: httpx.Response, model: str):
+    msg_id = f"msg_{uuid.uuid4().hex}"
+    yield _sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id, "type": "message", "role": "assistant",
+            "model": model, "content": [], "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    })
+
+    block_idx = 0
+    in_text_block = False
+    tool_calls_accum: dict[int, dict] = {}
+    stop_reason = "end_turn"
+    usage = {"input_tokens": 0, "output_tokens": 0}
+
+    async for line in oai_response.aiter_lines():
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        if chunk.get("usage"):
+            u = chunk["usage"]
+            usage["input_tokens"] = u.get("prompt_tokens", usage["input_tokens"])
+            usage["output_tokens"] = u.get("completion_tokens", usage["output_tokens"])
+
+        choices = chunk.get("choices", [])
+        if not choices:
+            continue
+
+        delta = choices[0].get("delta", {})
+        finish = choices[0].get("finish_reason")
+
+        if finish == "tool_calls":
+            stop_reason = "tool_use"
+        elif finish == "length":
+            stop_reason = "max_tokens"
+        elif finish == "stop":
+            stop_reason = "end_turn"
+
+        if delta.get("content"):
+            if not in_text_block:
+                yield _sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": block_idx,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                in_text_block = True
+            yield _sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": block_idx,
+                "delta": {"type": "text_delta", "text": delta["content"]},
+            })
+
+        if delta.get("tool_calls"):
+            if in_text_block:
+                yield _sse_event("content_block_stop", {
+                    "type": "content_block_stop", "index": block_idx,
+                })
+                block_idx += 1
+                in_text_block = False
+            for tc in delta["tool_calls"]:
+                tc_idx = tc.get("index", 0)
+                if tc_idx not in tool_calls_accum:
+                    tool_calls_accum[tc_idx] = {
+                        "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": "",
+                        "block_idx": block_idx,
+                    }
+                    yield _sse_event("content_block_start", {
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_calls_accum[tc_idx]["id"],
+                            "name": tool_calls_accum[tc_idx]["name"],
+                            "input": {},
+                        },
+                    })
+                    block_idx += 1
+                args_chunk = tc.get("function", {}).get("arguments", "")
+                if args_chunk:
+                    tool_calls_accum[tc_idx]["arguments"] += args_chunk
+                    yield _sse_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": tool_calls_accum[tc_idx]["block_idx"],
+                        "delta": {"type": "input_json_delta", "partial_json": args_chunk},
+                    })
+
+    if in_text_block:
+        yield _sse_event("content_block_stop", {
+            "type": "content_block_stop", "index": block_idx,
+        })
+    for tc in tool_calls_accum.values():
+        yield _sse_event("content_block_stop", {
+            "type": "content_block_stop", "index": tc["block_idx"],
+        })
+
+    yield _sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": usage["output_tokens"]},
+    })
+    yield _sse_event("message_stop", {"type": "message_stop"})
+
+
+def _chutes_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {CHUTES_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+@_proxy_app.get("/health")
+async def _proxy_health():
+    return {"status": "ok"}
+
+
+@_proxy_app.get("/")
+async def _proxy_root():
+    return {"proxy": "chutes", "models": CHUTES_MODELS, "status": "running"}
+
+
+async def _try_chutes_non_streaming(body: dict, model_name: str) -> tuple[httpx.Response | None, str | None]:
+    """Try a non-streaming request to a single model. Returns (response, error_msg)."""
+    oai_request = _build_openai_request(body, model_override=model_name)
+    oai_request.pop("stream", None)
+    oai_request.pop("stream_options", None)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(FALLBACK_TIMEOUT)) as client:
+            resp = await client.post(
+                f"{CHUTES_BASE_URL}/chat/completions",
+                json=oai_request, headers=_chutes_headers(),
+            )
+        if resp.status_code == 200:
+            return resp, None
+        return None, f"{model_name} returned {resp.status_code}: {resp.text[:200]}"
+    except httpx.TimeoutException:
+        return None, f"{model_name} timed out after {FALLBACK_TIMEOUT}s"
+    except Exception as exc:
+        return None, f"{model_name} error: {str(exc)[:200]}"
+
+
+async def _try_chutes_streaming(body: dict, model_name: str) -> tuple[httpx.AsyncClient | None, httpx.Response | None, str | None]:
+    """Try a streaming request to a single model. Returns (client, response, error_msg).
+    Caller must close client+response on success."""
+    oai_request = _build_openai_request(body, model_override=model_name)
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(PROXY_TIMEOUT))
+        resp = await client.send(
+            client.build_request(
+                "POST", f"{CHUTES_BASE_URL}/chat/completions",
+                json=oai_request, headers=_chutes_headers(),
+            ),
+            stream=True,
+        )
+        if resp.status_code == 200:
+            return client, resp, None
+        error_body = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        return None, None, f"{model_name} returned {resp.status_code}: {error_body.decode()[:200]}"
+    except httpx.TimeoutException:
+        return None, None, f"{model_name} timed out"
+    except Exception as exc:
+        return None, None, f"{model_name} error: {str(exc)[:200]}"
+
+
+@_proxy_app.post("/v1/messages")
+async def _proxy_messages(request: Request):
+    body = await request.json()
+    stream = body.get("stream", False)
+    model = body.get("model", CLAUDE_MODEL)
+
+    if stream:
+        last_error = ""
+        for model_name in CHUTES_MODELS:
+            client, oai_response, err = await _try_chutes_streaming(body, model_name)
+            if err:
+                last_error = err
+                _log(f"proxy fallback: {err}")
+                continue
+
+            async def generate(resp=oai_response, cl=client, mn=model_name):
+                try:
+                    _log(f"proxy: streaming from {mn}")
+                    async for event in _stream_openai_to_anthropic(resp, model):
+                        yield event
+                finally:
+                    await resp.aclose()
+                    await cl.aclose()
+
+            return StreamingResponse(
+                generate(), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        return JSONResponse(status_code=502, content={
+            "type": "error", "error": {
+                "type": "api_error",
+                "message": f"All models failed. Last: {last_error}",
+            },
+        })
+
+    else:
+        last_error = ""
+        for model_name in CHUTES_MODELS:
+            resp, err = await _try_chutes_non_streaming(body, model_name)
+            if err:
+                last_error = err
+                _log(f"proxy fallback: {err}")
+                continue
+            _log(f"proxy: response from {model_name}")
+            return JSONResponse(content=_openai_response_to_anthropic(resp.json(), model))
+
+        return JSONResponse(status_code=502, content={
+            "type": "error", "error": {
+                "type": "api_error",
+                "message": f"All models failed. Last: {last_error}",
+            },
+        })
+
+
+@_proxy_app.post("/v1/messages/count_tokens")
+async def _proxy_count_tokens(request: Request):
+    body = await request.json()
+    rough = sum(len(json.dumps(m)) for m in body.get("messages", [])) // 4
+    rough += len(json.dumps(body.get("tools", []))) // 4
+    rough += len(str(body.get("system", ""))) // 4
+    return JSONResponse(content={"input_tokens": max(rough, 1)})
+
+
+def _start_proxy():
+    """Run the Chutes translation proxy in-process on a background thread."""
+    config = uvicorn.Config(
+        _proxy_app, host="127.0.0.1", port=PROXY_PORT, log_level="warning",
+    )
+    server = uvicorn.Server(config)
+    server.run()
+
+
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
-IS_ROOT = os.getuid() == 0
-
-
 def _claude_cmd(prompt: str, extra_flags: list[str] | None = None) -> list[str]:
-    """Build a claude CLI command, adding --dangerously-skip-permissions only when not root."""
     cmd = ["claude", "-p", prompt]
     if not IS_ROOT:
         cmd.append("--dangerously-skip-permissions")
@@ -298,16 +745,10 @@ def _claude_cmd(prompt: str, extra_flags: list[str] | None = None) -> list[str]:
 
 
 def _write_claude_settings():
-    """Write project-level .claude/settings.local.json.
-
-    Forces OpenRouter as the API backend using OPENROUTER_API_KEY from .env.
-    Overrides any global claude settings that may point elsewhere.
-    """
+    """Point Claude Code at the in-process Chutes proxy."""
     settings_dir = WORKING_DIR / ".claude"
     settings_dir.mkdir(exist_ok=True)
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        _log("WARNING: OPENROUTER_API_KEY not set in .env — claude calls will fail")
+    proxy_url = f"http://127.0.0.1:{PROXY_PORT}"
     settings = {
         "model": CLAUDE_MODEL,
         "permissions": {
@@ -318,28 +759,22 @@ def _write_claude_settings():
             ],
         },
         "env": {
-            "ANTHROPIC_API_KEY": api_key,
-            "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
+            "ANTHROPIC_API_KEY": "chutes-proxy",
+            "ANTHROPIC_BASE_URL": proxy_url,
             "ANTHROPIC_AUTH_TOKEN": "",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         },
     }
     (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
-    _log(f"wrote .claude/settings.local.json (model={CLAUDE_MODEL})")
+    _log(f"wrote .claude/settings.local.json (model={CLAUDE_MODEL}, proxy={proxy_url})")
 
 
 def _claude_env() -> dict[str, str]:
     env = os.environ.copy()
-    api_key = env.get("OPENROUTER_API_KEY", "")
-    if api_key:
-        env["ANTHROPIC_API_KEY"] = api_key
-    env["ANTHROPIC_BASE_URL"] = "https://openrouter.ai/api"
+    env["ANTHROPIC_API_KEY"] = "chutes-proxy"
+    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{PROXY_PORT}"
     env["ANTHROPIC_AUTH_TOKEN"] = ""
     return env
-
-
-MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
 
 
 def _run_claude_once(cmd, env, on_text=None):
@@ -572,43 +1007,37 @@ def agent_loop():
         _agent_wake.clear()
 
 
-TRANSCRIPTION_MODEL = os.environ.get("TRANSCRIPTION_MODEL", "google/gemini-2.5-flash")
-
-
 def transcribe_voice(file_path: str, fmt: str = "ogg") -> str:
-    """Transcribe an audio file via OpenRouter's audio-capable models."""
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        return "(transcription failed: no API key)"
-
-    with open(file_path, "rb") as f:
-        b64_audio = base64.b64encode(f.read()).decode("utf-8")
-
-    payload = {
-        "model": TRANSCRIPTION_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Transcribe this audio exactly. Return only the transcription, nothing else."},
-                    {"type": "input_audio", "input_audio": {"data": b64_audio, "format": fmt}},
-                ],
-            }
-        ],
-    }
-
+    """Transcribe audio by sending it through the Chutes proxy (Anthropic Messages API)."""
     try:
+        with open(file_path, "rb") as f:
+            b64_audio = base64.b64encode(f.read()).decode("utf-8")
+
         resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=60,
+            f"http://127.0.0.1:{PROXY_PORT}/v1/messages",
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": 4096,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        "The user sent a voice note. The audio has been attached but you may not be able "
+                        "to process it directly. If you can read audio, transcribe it exactly. Otherwise, "
+                        "reply with: (voice note received but transcription unavailable)"
+                    ),
+                }],
+            },
+            timeout=90,
         )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        if resp.status_code == 200:
+            data = resp.json()
+            text = data.get("content", [{}])[0].get("text", "")
+            if text.strip():
+                return text.strip()
+        return "(voice transcription unavailable — send text instead)"
     except Exception as exc:
         _log(f"transcription failed: {str(exc)[:200]}")
-        return f"(transcription failed: {str(exc)[:100]})"
+        return "(voice transcription unavailable — send text instead)"
 
 
 # ── Telegram bot ─────────────────────────────────────────────────────────────
@@ -850,6 +1279,14 @@ def main() -> None:
 
     _log(f"arbos starting in {WORKING_DIR}")
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not CHUTES_API_KEY:
+        _log("WARNING: CHUTES_API_KEY not set — proxy will fail")
+
+    _log(f"starting chutes proxy thread (port={PROXY_PORT}, model={CLAUDE_MODEL})")
+    threading.Thread(target=_start_proxy, daemon=True).start()
+    time.sleep(1)
+
     _write_claude_settings()
 
     threading.Thread(target=agent_loop, daemon=True).start()

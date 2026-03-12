@@ -21,7 +21,7 @@
 ## Requirements
 
 - [Telegram Bot token](https://core.telegram.org/bots#how-do-i-create-a-bot)
-- [OpenRouter API key](https://openrouter.ai/settings/keys)
+- [Chutes API key](https://chutes.ai)
 
 ## Getting started
 
