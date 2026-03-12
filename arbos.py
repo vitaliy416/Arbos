@@ -1301,16 +1301,16 @@ def _build_operator_prompt(user_text: str) -> str:
 
 
 _TOOL_LABELS = {
-    "Bash": "running command",
+    "Bash": "running",
     "Read": "reading",
     "Write": "writing",
     "Edit": "editing",
-    "Glob": "searching files",
-    "Grep": "searching code",
-    "WebFetch": "fetching URL",
-    "WebSearch": "searching web",
+    "Glob": "searching",
+    "Grep": "locating",
+    "WebFetch": "downloading",
+    "WebSearch": "browsing",
     "TodoWrite": "planning",
-    "Task": "running subtask",
+    "Task": "executing",
 }
 
 
